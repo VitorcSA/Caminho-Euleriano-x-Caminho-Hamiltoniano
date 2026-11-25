@@ -1,559 +1,483 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import csv
 import json
-from pathlib import Path
+import math
 import random
 import shutil
 import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
+# ----------------------------------------------------------------------------
+# Configuração
+# ----------------------------------------------------------------------------
 SEED = 42
 REPETITIONS = 20
 WARMUP_ROUNDS = 2
 WARMUP_MAX_SECONDS = 5.0
 TIMEOUT_SECONDS = 60.0
 SLOW_BLOCK_LIMIT_SECONDS = 90.0
-JSON_BUFFER_BYTES = 8 * 1024 * 1024
+MIN_REPS_FOR_PARTIAL = 3
+JSON_BUFFER = 8 * 1024 * 1024
 
 HIERHOLZER_SIZES = [100, 1_000, 10_000, 50_000, 100_000, 500_000, 1_000_000]
 BACKTRACKING_SIZES = list(range(10, 36, 2))
 SCENARIOS = ["melhor", "medio", "pior"]
 
-ROOT_DIR = Path(__file__).resolve().parent
-CSV_PATH = ROOT_DIR / "resultados.csv"
-CSV_COLUMNS = [
-    "linguagem",
-    "problema",
-    "algoritmo",
-    "cenario",
-    "n",
-    "m",
-    "media_ms",
-    "desvio_padrao_ms",
-    "repeticoes",
-    "status",
+ROOT = Path(__file__).resolve().parent
+CSV_PATH = ROOT / "resultados.csv"
+CSV_HEADER = [
+    "linguagem", "problema", "algoritmo", "cenario", "n", "m",
+    "media_ms", "desvio_padrao_ms", "repeticoes", "status",
 ]
 
+ALGORITHMS = [
+    {
+        "algoritmo": "Hierholzer",
+        "problema": "eulerian",
+        "sizes": HIERHOLZER_SIZES,
+        "dir": ROOT / "graph" / "eulerian",
+    },
+    {
+        "algoritmo": "Backtracking",
+        "problema": "hamiltonian",
+        "sizes": BACKTRACKING_SIZES,
+        "dir": ROOT / "graph" / "hamiltonian",
+    },
+]
 
-def print_live(text: str) -> None:
-    cols = shutil.get_terminal_size(fallback=(120, 24)).columns
-    max_len = max(10, cols - 1)
-    if len(text) > max_len:
-        text = text[: max_len - 3] + "..."
-    sys.stdout.write("\r" + text.ljust(max_len))
+RUNNERS = [
+    {
+        "name": "C",
+        "cwd": ROOT,
+        "cmd": lambda problema, path: ["./grafo_bench", problema, path],
+    },
+    {
+        "name": "Python",
+        "cwd": ROOT / "python",
+        "cmd": lambda problema, path: [sys.executable, "main.py", problema, path],
+    },
+]
+
+rng = random.Random(SEED)
+
+
+# ----------------------------------------------------------------------------
+# Terminal
+# ----------------------------------------------------------------------------
+def term_cols():
+    return max(20, shutil.get_terminal_size((100, 24)).columns)
+
+
+def live(msg):
+    cols = term_cols()
+    sys.stdout.write("\r" + msg[: cols - 1].ljust(cols - 1))
     sys.stdout.flush()
 
 
-def clear_live() -> None:
-    cols = shutil.get_terminal_size(fallback=(120, 24)).columns
-    max_len = max(10, cols - 1)
-    sys.stdout.write("\r" + (" " * max_len) + "\r")
+def clear_live():
+    cols = term_cols()
+    sys.stdout.write("\r" + " " * (cols - 1) + "\r")
     sys.stdout.flush()
 
 
-def clean_instance_files(folder: Path) -> None:
-    if not folder.exists():
-        return
-    for file_path in folder.glob("inst_*.json"):
+def permanent(msg):
+    clear_live()
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+
+
+# ----------------------------------------------------------------------------
+# Utilidades de grafos (list[set[int]] durante a construção)
+# ----------------------------------------------------------------------------
+def new_adj(n):
+    return [set() for _ in range(n)]
+
+
+def add_edge(adj, u, v):
+    adj[u].add(v)
+    adj[v].add(u)
+
+
+def finalize(adj):
+    out = []
+    for s in adj:
+        lst = list(s)
+        rng.shuffle(lst)
+        out.append(lst)
+    return out
+
+
+def count_edges(lists):
+    return sum(len(x) for x in lists) // 2
+
+
+def random_cycle(adj, n):
+    perm = list(range(n))
+    rng.shuffle(perm)
+    for i in range(n):
+        add_edge(adj, perm[i], perm[(i + 1) % n])
+    return n
+
+
+def add_triangles(adj, n, m, target, pivots=None):
+    needed = (target - m) // 3
+    if needed <= 0:
+        return m
+    added = 0
+    attempts = 0
+    max_attempts = 30 * needed + 1000
+    npiv = len(pivots) if pivots else 0
+    while added < needed and attempts < max_attempts:
+        attempts += 1
+        if npiv and rng.random() < 0.5:
+            u = pivots[rng.randrange(npiv)]
+        else:
+            u = rng.randrange(n)
+        v = rng.randrange(n)
+        w = rng.randrange(n)
+        if u == v or u == w or v == w:
+            continue
+        au = adj[u]
+        if v in au or w in au or w in adj[v]:
+            continue
+        au.add(v)
+        au.add(w)
+        adj[v].add(u)
+        adj[v].add(w)
+        adj[w].add(u)
+        adj[w].add(v)
+        added += 1
+    return m + 3 * added
+
+
+def add_random_edges(adj, n, m, target):
+    max_edges = n * (n - 1) // 2
+    target = min(target, max_edges)
+    while m < target:
+        u = rng.randrange(n)
+        v = rng.randrange(n)
+        if u == v or v in adj[u]:
+            continue
+        add_edge(adj, u, v)
+        m += 1
+    return m
+
+
+# ----------------------------------------------------------------------------
+# Geradores: Hierholzer
+# ----------------------------------------------------------------------------
+def gen_euler_melhor(n):
+    adj = new_adj(n)
+    random_cycle(adj, n)
+    return finalize(adj)
+
+
+def _euler_cap(n):
+    return int(0.45 * n * (n - 1) / 2)
+
+
+def gen_euler_medio(n):
+    adj = new_adj(n)
+    m = random_cycle(adj, n)
+    target = min(_euler_cap(n), round(rng.uniform(2.0, 2.6) * n))
+    add_triangles(adj, n, m, target)
+    return finalize(adj)
+
+
+def gen_euler_pior(n):
+    adj = new_adj(n)
+    m = random_cycle(adj, n)
+    k = min(n, max(5, n // 20))
+    pivots = rng.sample(range(n), k)
+    target = min(_euler_cap(n), round(rng.uniform(6.5, 8.5) * n))
+    add_triangles(adj, n, m, target, pivots=pivots)
+    return finalize(adj)
+
+
+# ----------------------------------------------------------------------------
+# Geradores: Backtracking
+# ----------------------------------------------------------------------------
+def gen_ham_melhor(n):
+    adj = new_adj(n)
+    rest = list(range(1, n))
+    rng.shuffle(rest)
+    path = [0] + rest
+    for i in range(n):
+        add_edge(adj, path[i], path[(i + 1) % n])
+    target = min(n * (n - 1) // 2, rng.randint(round(1.1 * n), round(1.4 * n)))
+    add_random_edges(adj, n, n, target)
+    lists = finalize(adj)
+    for i in range(n):
+        u = path[i]
+        nxt = path[(i + 1) % n]
+        lst = lists[u]
+        lst.remove(nxt)
+        lst.insert(0, nxt)
+    return lists
+
+
+def gen_ham_medio(n):
+    adj = new_adj(n)
+    perm = list(range(n))
+    rng.shuffle(perm)
+    for i in range(1, n):
+        add_edge(adj, perm[i], perm[rng.randrange(i)])
+    target = min(n * (n - 1) // 2, rng.randint(round(1.3 * n), round(1.7 * n)))
+    add_random_edges(adj, n, n - 1, target)
+    return finalize(adj)
+
+
+def gen_ham_pior(n):
+    adj = new_adj(n)
+    perm = list(range(n))
+    rng.shuffle(perm)
+    a = n // 2 - 1
+    A = perm[:a]
+    B = perm[a:]
+    for i in range(1, a):
+        add_edge(adj, A[i], A[rng.randrange(i)])
+    for v in B:
+        for u in rng.sample(A, 2):
+            add_edge(adj, v, u)
+    candidates = []
+    for i in range(a):
+        ai = A[i]
+        for v in B:
+            if v not in adj[ai]:
+                candidates.append((ai, v))
+        for j in range(i + 1, a):
+            aj = A[j]
+            if aj not in adj[ai]:
+                candidates.append((ai, aj))
+    rng.shuffle(candidates)
+    k = int(rng.uniform(0.65, 0.90) * len(candidates))
+    for u, v in candidates[:k]:
+        add_edge(adj, u, v)
+    return finalize(adj)
+
+
+GENERATORS = {
+    ("Hierholzer", "melhor"): gen_euler_melhor,
+    ("Hierholzer", "medio"): gen_euler_medio,
+    ("Hierholzer", "pior"): gen_euler_pior,
+    ("Backtracking", "melhor"): gen_ham_melhor,
+    ("Backtracking", "medio"): gen_ham_medio,
+    ("Backtracking", "pior"): gen_ham_pior,
+}
+
+
+# ----------------------------------------------------------------------------
+# Arquivos temporários
+# ----------------------------------------------------------------------------
+def inst_path(directory, i):
+    return directory / f"inst_{i:02d}.json"
+
+
+def clean_instances(directory):
+    for p in directory.glob("inst_*.json"):
         try:
-            file_path.unlink()
+            p.unlink()
         except OSError:
             pass
 
 
-def save_graph_json(adj: list[list[int]], file_path: Path) -> None:
-    with file_path.open("w", encoding="utf-8", buffering=JSON_BUFFER_BYTES) as f:
-        json.dump(adj, f, separators=(",", ":"))
+def generate_batch(algoritmo, cenario, n, directory):
+    gen = GENERATORS[(algoritmo, cenario)]
+    total_m = 0
+    t0 = time.perf_counter()
+    for i in range(1, REPETITIONS + 1):
+        live(f"[gerando] {algoritmo}/{cenario} n={n:,} inst {i:02d}/{REPETITIONS} "
+             f"({time.perf_counter() - t0:.1f}s)")
+        lists = gen(n)
+        total_m += count_edges(lists)
+        payload = json.dumps(lists, separators=(",", ":"))
+        del lists
+        with open(inst_path(directory, i), "w", buffering=JSON_BUFFER, encoding="utf-8") as f:
+            f.write(payload)
+        del payload
+    live(f"[gerando] {algoritmo}/{cenario} n={n:,} concluído em {time.perf_counter() - t0:.1f}s")
+    return round(total_m / REPETITIONS)
 
 
-def _build_random_cycle(n: int, rng: random.Random) -> tuple[list[set[int]], list[int], int]:
-    order = list(range(n))
-    rng.shuffle(order)
-    adj: list[set[int]] = [set() for _ in range(n)]
-    for i in range(n):
-        u = order[i]
-        v = order[(i + 1) % n]
-        adj[u].add(v)
-        adj[v].add(u)
-    return adj, order, n
-
-
-def generate_eulerian_graph(
-    n: int, scenario: str, rng: random.Random
-) -> tuple[list[list[int]], int]:
-    adj, _, m = _build_random_cycle(n, rng)
-    max_sparse_edges = int(0.45 * (n * (n - 1) // 2))
-
-    if scenario == "medio":
-        raw_target = round(rng.uniform(2.0, 2.6) * n)
-        m_target = min(max_sparse_edges, raw_target)
-        max_attempts = max(1000, (m_target - m) * 20)
-        attempts = 0
-        while m + 2 < m_target and attempts < max_attempts:
-            attempts += 1
-            u = rng.randrange(n)
-            v = rng.randrange(n)
-            w = rng.randrange(n)
-            if u == v or v == w or u == w:
-                continue
-            if v in adj[u] or w in adj[v] or u in adj[w]:
-                continue
-            adj[u].add(v)
-            adj[v].add(u)
-            adj[v].add(w)
-            adj[w].add(v)
-            adj[w].add(u)
-            adj[u].add(w)
-            m += 3
-
-    elif scenario == "pior":
-        raw_target = round(rng.uniform(6.5, 8.5) * n)
-        m_target = min(max_sparse_edges, raw_target)
-        num_pivots = min(n, max(5, n // 20))
-        pivots = rng.sample(range(n), num_pivots)
-        max_attempts = max(2000, (m_target - m) * 25)
-        attempts = 0
-        while m + 2 < m_target and attempts < max_attempts:
-            attempts += 1
-            mode = rng.random()
-            if mode < 0.45 and num_pivots >= 2:
-                u, v = rng.sample(pivots, 2)
-                w = rng.randrange(n)
-            elif mode < 0.75:
-                u = rng.choice(pivots)
-                v = rng.randrange(n)
-                w = rng.randrange(n)
-            else:
-                u = rng.randrange(n)
-                v = rng.randrange(n)
-                w = rng.randrange(n)
-
-            if u == v or v == w or u == w:
-                continue
-            if v in adj[u] or w in adj[v] or u in adj[w]:
-                continue
-            adj[u].add(v)
-            adj[v].add(u)
-            adj[v].add(w)
-            adj[w].add(v)
-            adj[w].add(u)
-            adj[u].add(w)
-            m += 3
-
-    result: list[list[int]] = []
-    for neighbors_set in adj:
-        neighbors = list(neighbors_set)
-        rng.shuffle(neighbors)
-        result.append(neighbors)
-    return result, m
-
-
-def generate_hamiltonian_graph(
-    n: int, scenario: str, rng: random.Random
-) -> tuple[list[list[int]], int]:
-    max_edges = n * (n - 1) // 2
-    adj: list[set[int]] = [set() for _ in range(n)]
-
-    if scenario == "melhor":
-        rest = list(range(1, n))
-        rng.shuffle(rest)
-        path = [0] + rest
-        for i in range(n):
-            u = path[i]
-            v = path[(i + 1) % n]
-            adj[u].add(v)
-            adj[v].add(u)
-        m = n
-
-        m_target = min(max_edges, rng.randint(round(1.1 * n), round(1.4 * n)))
-        while m < m_target:
-            u = rng.randrange(n)
-            v = rng.randrange(n)
-            if u != v and v not in adj[u]:
-                adj[u].add(v)
-                adj[v].add(u)
-                m += 1
-
-        next_in_cycle = [0] * n
-        for i in range(n):
-            next_in_cycle[path[i]] = path[(i + 1) % n]
-
-        result = []
-        for u in range(n):
-            neighbors = list(adj[u])
-            rng.shuffle(neighbors)
-            forced_next = next_in_cycle[u]
-            neighbors.remove(forced_next)
-            neighbors.insert(0, forced_next)
-            result.append(neighbors)
-        return result, m
-
-    if scenario == "medio":
-        order = list(range(n))
-        rng.shuffle(order)
-        for i in range(1, n):
-            u = order[i]
-            v = order[rng.randrange(i)]
-            adj[u].add(v)
-            adj[v].add(u)
-        m = n - 1
-
-        m_target = min(max_edges, rng.randint(round(1.3 * n), round(1.7 * n)))
-        while m < m_target:
-            u = rng.randrange(n)
-            v = rng.randrange(n)
-            if u != v and v not in adj[u]:
-                adj[u].add(v)
-                adj[v].add(u)
-                m += 1
-
-        result = []
-        for neighbors_set in adj:
-            neighbors = list(neighbors_set)
-            rng.shuffle(neighbors)
-            result.append(neighbors)
-        return result, m
-
-    # scenario == "pior"
-    perm = list(range(n))
-    rng.shuffle(perm)
-    a = (n // 2) - 1
-    set_a = perm[:a]
-    set_b = perm[a:]
-    b = len(set_b)
-
-    m = 0
-    for i in range(1, a):
-        u = set_a[i]
-        v = set_a[rng.randrange(i)]
-        adj[u].add(v)
-        adj[v].add(u)
-        m += 1
-
-    for u in set_b:
-        chosen_a = rng.sample(set_a, 2)
-        for v in chosen_a:
-            if v not in adj[u]:
-                adj[u].add(v)
-                adj[v].add(u)
-                m += 1
-
-    candidates: list[tuple[int, int]] = []
-    for i in range(a):
-        u = set_a[i]
-        for j in range(i + 1, a):
-            v = set_a[j]
-            if v not in adj[u]:
-                candidates.append((u, v))
-    for u in set_a:
-        for v in set_b:
-            if v not in adj[u]:
-                candidates.append((u, v))
-
-    rng.shuffle(candidates)
-    max_allowed = (a * (a - 1) // 2) + (a * b)
-    target_total = round(rng.uniform(0.65, 0.90) * max_allowed)
-    extra_needed = min(len(candidates), max(0, target_total - m))
-
-    for u, v in candidates[:extra_needed]:
-        adj[u].add(v)
-        adj[v].add(u)
-        m += 1
-
-    result = []
-    for neighbors_set in adj:
-        neighbors = list(neighbors_set)
-        rng.shuffle(neighbors)
-        result.append(neighbors)
-    return result, m
-
-
-def generate_batch(
-    problema: str,
-    algoritmo: str,
-    scenario: str,
-    n: int,
-    target_dir: Path,
-    rng: random.Random,
-) -> tuple[list[Path], int]:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    clean_instance_files(target_dir)
-
-    instance_paths: list[Path] = []
-    edge_counts: list[int] = []
-
-    for idx in range(1, REPETITIONS + 1):
-        print_live(
-            f"[{algoritmo} | {scenario} | n={n:,}] Gerando lote: {idx}/{REPETITIONS} instâncias..."
-        )
-        if problema == "eulerian":
-            graph, m = generate_eulerian_graph(n, scenario, rng)
-        else:
-            graph, m = generate_hamiltonian_graph(n, scenario, rng)
-
-        inst_path = target_dir / f"inst_{idx:02d}.json"
-        save_graph_json(graph, inst_path)
-        instance_paths.append(inst_path)
-        edge_counts.append(m)
-
-    m_avg = round(sum(edge_counts) / len(edge_counts))
-    return instance_paths, m_avg
-
-
-def run_single_invocation(
-    language: str, problema: str, json_path: Path
-) -> tuple[str, float]:
-    abs_json = str(json_path.resolve())
-    if language == "C":
-        cmd = [str(ROOT_DIR / "grafo_bench"), problema, abs_json]
-        cwd = str(ROOT_DIR)
-    else:
-        cmd = [sys.executable, "main.py", problema, abs_json]
-        cwd = str(ROOT_DIR / "python")
-
+# ----------------------------------------------------------------------------
+# Execução
+# ----------------------------------------------------------------------------
+def run_once(runner, problema, path):
+    """Retorna (tempo_ms | None, status) com status em OK/TIMEOUT/ERRO."""
+    cmd = runner["cmd"](problema, str(path.resolve()))
     try:
         proc = subprocess.run(
             cmd,
-            cwd=cwd,
+            cwd=str(runner["cwd"]),
             capture_output=True,
             text=True,
             timeout=TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        return "TIMEOUT", 0.0
+        return None, "TIMEOUT"
     except OSError:
-        return "ERRO", 0.0
-
+        return None, "ERRO"
     if proc.returncode != 0:
-        return "ERRO", 0.0
-
-    raw_out = proc.stdout.strip()
-    if not raw_out:
-        return "ERRO", 0.0
-
+        return None, "ERRO"
     try:
-        elapsed_ms = float(raw_out.splitlines()[-1].strip())
+        value = float(proc.stdout.strip())
     except ValueError:
-        return "ERRO", 0.0
-
-    if not (elapsed_ms >= 0.0) or elapsed_ms == float("inf"):
-        return "ERRO", 0.0
-
-    return "OK", elapsed_ms
+        return None, "ERRO"
+    if not math.isfinite(value) or value < 0:
+        return None, "ERRO"
+    return value, "OK"
 
 
-def benchmark_runner(
-    language: str,
-    problema: str,
-    algoritmo: str,
-    scenario: str,
-    n: int,
-    m_avg: int,
-    instance_paths: list[Path],
-) -> dict[str, object]:
-    for w_idx in range(1, WARMUP_ROUNDS + 1):
-        print_live(
-            f"[{algoritmo} | {scenario} | n={n:,} | {language}] Aquecimento {w_idx}/{WARMUP_ROUNDS}..."
-        )
-        w_start = time.perf_counter()
-        w_status, _ = run_single_invocation(language, problema, instance_paths[0])
-        w_elapsed = time.perf_counter() - w_start
+def run_block(runner, algo, cenario, n, directory):
+    problema = algo["problema"]
+    algoritmo = algo["algoritmo"]
+    lang = runner["name"]
+    tag = f"[{lang}] {algoritmo}/{cenario} n={n:,}"
+    first = inst_path(directory, 1)
 
-        if w_status != "OK":
-            clear_live()
-            return {
-                "linguagem": language,
-                "problema": problema,
-                "algoritmo": algoritmo,
-                "cenario": scenario,
-                "n": n,
-                "m": m_avg,
-                "media_ms": "",
-                "desvio_padrao_ms": "",
-                "repeticoes": 0,
-                "status": w_status,
-                "acum_s": 0.0,
-                "mean_val": None,
-                "std_val": None,
-            }
-
-        if w_idx == 1 and w_elapsed > WARMUP_MAX_SECONDS:
+    # Aquecimento (descartado da estatística)
+    for r in range(1, WARMUP_ROUNDS + 1):
+        live(f"{tag} aquecimento {r}/{WARMUP_ROUNDS}")
+        t0 = time.perf_counter()
+        _, st = run_once(runner, problema, first)
+        elapsed = time.perf_counter() - t0
+        if st != "OK":
+            break
+        if r == 1 and elapsed > WARMUP_MAX_SECONDS:
             break
 
-    times_ms: list[float] = []
-    final_status = "OK"
+    samples = []
+    status = "OK"
     block_start = time.perf_counter()
-
-    for idx, inst_path in enumerate(instance_paths, start=1):
-        status, elapsed_ms = run_single_invocation(language, problema, inst_path)
-        acum_s = time.perf_counter() - block_start
-
-        if status != "OK":
-            final_status = status
+    acum = 0.0
+    for i in range(1, REPETITIONS + 1):
+        live(f"{tag} rep {i:02d}/{REPETITIONS} acum={acum:.1f}s")
+        value, st = run_once(runner, problema, inst_path(directory, i))
+        acum = time.perf_counter() - block_start
+        if st != "OK":
+            status = st
             break
-
-        times_ms.append(elapsed_ms)
-        print_live(
-            f"[{algoritmo} | {scenario} | n={n:,} | {language}] "
-            f"Rep {idx}/{REPETITIONS} | ultima={elapsed_ms:.3f} ms | acum={acum_s:.2f}s"
-        )
-
-        if len(times_ms) >= 3 and acum_s > SLOW_BLOCK_LIMIT_SECONDS and idx < REPETITIONS:
-            final_status = "PARCIAL_90S"
+        samples.append(value)
+        if (i < REPETITIONS and len(samples) >= MIN_REPS_FOR_PARTIAL
+                and acum > SLOW_BLOCK_LIMIT_SECONDS):
+            status = "PARCIAL_90S"
             break
+    return samples, status, acum
 
-    acum_total_s = time.perf_counter() - block_start
-    clear_live()
 
-    reps = len(times_ms)
-    if reps == 0:
-        mean_val = None
-        std_val = None
-        media_str = ""
-        std_str = ""
-    elif reps == 1:
-        mean_val = statistics.mean(times_ms)
-        std_val = 0.0
-        media_str = f"{mean_val:.6f}"
-        std_str = "0.0"
+def compute_stats(samples):
+    k = len(samples)
+    if k == 0:
+        return "", ""
+    mean = statistics.fmean(samples)
+    dev = 0.0 if k == 1 else statistics.stdev(samples)
+    return mean, dev
+
+
+def fmt_num(x):
+    return "" if x == "" else f"{x:.6f}"
+
+
+def report_block(writer, fh, runner, algo, cenario, n, m, samples, status, acum):
+    mean, dev = compute_stats(samples)
+    writer.writerow([
+        runner["name"], algo["problema"], algo["algoritmo"], cenario, n, m,
+        fmt_num(mean), fmt_num(dev), len(samples), status,
+    ])
+    fh.flush()
+    if mean == "":
+        stats_txt = f"{'-':>12} ± {'-':>10} ms"
     else:
-        mean_val = statistics.mean(times_ms)
-        std_val = statistics.stdev(times_ms)
-        media_str = f"{mean_val:.6f}"
-        std_str = f"{std_val:.6f}"
-
-    return {
-        "linguagem": language,
-        "problema": problema,
-        "algoritmo": algoritmo,
-        "cenario": scenario,
-        "n": n,
-        "m": m_avg,
-        "media_ms": media_str,
-        "desvio_padrao_ms": std_str,
-        "repeticoes": reps,
-        "status": final_status,
-        "acum_s": acum_total_s,
-        "mean_val": mean_val,
-        "std_val": std_val,
-    }
-
-
-def print_runner_result(res: dict[str, object]) -> None:
-    mean_val = res["mean_val"]
-    std_val = res["std_val"]
-    if mean_val is None:
-        stats_col = f"{'-':>25}"
-    else:
-        stats_col = f"{mean_val:10.3f} ± {std_val:8.3f} ms"
-
-    line = (
-        f"{str(res['linguagem']):<6} | "
-        f"{str(res['algoritmo']):<12} | "
-        f"{str(res['cenario']):<6} | "
-        f"n={int(res['n']):>9} | "
-        f"m={int(res['m']):>10} | "
-        f"acum={float(res['acum_s']):>6.2f}s | "
-        f"{stats_col} | "
-        f"reps={int(res['repeticoes']):>2}/{REPETITIONS} | "
-        f"{res['status']}"
+        stats_txt = f"{mean:>12.4f} ± {dev:>10.4f} ms"
+    permanent(
+        f"{runner['name']:<6} {algo['algoritmo']:<12} {cenario:<6} "
+        f"n={n:>9,} m={m:>10,} acum={acum:>7.2f}s  {stats_txt}  "
+        f"reps={len(samples):>2}/{REPETITIONS}  {status}"
     )
-    print(line, flush=True)
+    return mean
 
 
-def print_backtracking_summary(
-    best_viable: dict[tuple[str, str], tuple[int, float] | None]
-) -> None:
-    print("\n" + "=" * 78)
-    print("RESUMO BACKTRACKING (HAMILTONIANO) — MAIOR N VIÁVEL EM ATÉ 60s")
-    print("=" * 78)
-    header = f"{'Cenário':<10} | {'Linguagem':<10} | {'Maior n Viável':>15} | {'Média (ms)':>18}"
-    print(header)
-    print("-" * 78)
-    for scenario in SCENARIOS:
+# ----------------------------------------------------------------------------
+# Principal
+# ----------------------------------------------------------------------------
+def print_summary(best):
+    print()
+    print("=" * 96)
+    print("RESUMO — Backtracking (Hamiltoniano): maior n viável em até "
+          f"{TIMEOUT_SECONDS:.0f}s e média (ms)")
+    print("=" * 96)
+    print(f"{'cenario':<8} | {'C: maior n':>10} | {'C: média ms':>16} | "
+          f"{'Python: maior n':>15} | {'Python: média ms':>18}")
+    print("-" * 96)
+    for cen in SCENARIOS:
+        cells = []
         for lang in ("C", "Python"):
-            entry = best_viable.get((scenario, lang))
+            entry = best.get((cen, lang))
             if entry is None:
-                n_str = "N/A"
-                mean_str = "N/A"
+                cells.append(("-", "-"))
             else:
-                n_str = f"{entry[0]:,}"
-                mean_str = f"{entry[1]:.3f}"
-            print(f"{scenario:<10} | {lang:<10} | {n_str:>15} | {mean_str:>18}")
-    print("=" * 78, flush=True)
+                cells.append((str(entry[0]), f"{entry[1]:.4f}"))
+        print(f"{cen:<8} | {cells[0][0]:>10} | {cells[0][1]:>16} | "
+              f"{cells[1][0]:>15} | {cells[1][1]:>18}")
+    print("=" * 96)
 
 
-def main() -> None:
-    rng = random.Random(SEED)
+def main():
+    if not (ROOT / "grafo_bench").exists():
+        sys.exit("Erro: executável ./grafo_bench não encontrado na raiz do projeto.")
+    if not (ROOT / "python" / "main.py").exists():
+        sys.exit("Erro: python/main.py não encontrado.")
 
-    benchmarks = [
-        ("eulerian", "Hierholzer", HIERHOLZER_SIZES, ROOT_DIR / "graph" / "eulerian"),
-        ("hamiltonian", "Backtracking", BACKTRACKING_SIZES, ROOT_DIR / "graph" / "hamiltonian"),
-    ]
+    best = {}
+    with open(CSV_PATH, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(CSV_HEADER)
+        fh.flush()
 
-    best_viable_bt: dict[tuple[str, str], tuple[int, float] | None] = {
-        (scenario, lang): None for scenario in SCENARIOS for lang in ("C", "Python")
-    }
+        for algo in ALGORITHMS:
+            directory = algo["dir"]
+            directory.mkdir(parents=True, exist_ok=True)
+            algoritmo = algo["algoritmo"]
+            print(f"\n### {algoritmo} ({algo['problema']}) ###")
 
-    with CSV_PATH.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        csv_file.flush()
+            for cenario in SCENARIOS:
+                stopped = {r["name"]: False for r in RUNNERS}
 
-        for problema, algoritmo, sizes, graph_dir in benchmarks:
-            graph_dir.mkdir(parents=True, exist_ok=True)
-            print(f"\n=== INICIANDO BENCHMARK: {algoritmo.upper()} ({problema}) ===", flush=True)
-
-            for scenario in SCENARIOS:
-                print(f"\n--- Cenário: {scenario} ---", flush=True)
-                stopped_runners: set[str] = set()
-
-                for n in sizes:
-                    active_runners = [lang for lang in ("C", "Python") if lang not in stopped_runners]
-                    if not active_runners:
+                for n in algo["sizes"]:
+                    if all(stopped.values()):
                         break
 
+                    clean_instances(directory)
                     try:
-                        instance_paths, m_avg = generate_batch(
-                            problema=problema,
-                            algoritmo=algoritmo,
-                            scenario=scenario,
-                            n=n,
-                            target_dir=graph_dir,
-                            rng=rng,
-                        )
+                        m = generate_batch(algoritmo, cenario, n, directory)
 
-                        for lang in active_runners:
-                            res = benchmark_runner(
-                                language=lang,
-                                problema=problema,
-                                algoritmo=algoritmo,
-                                scenario=scenario,
-                                n=n,
-                                m_avg=m_avg,
-                                instance_paths=instance_paths,
-                            )
-                            print_runner_result(res)
-
-                            writer.writerow({col: res[col] for col in CSV_COLUMNS})
-                            csv_file.flush()
-
-                            if (
-                                problema == "hamiltonian"
-                                and res["mean_val"] is not None
-                                and res["status"] in ("OK", "PARCIAL_90S")
-                            ):
-                                best_viable_bt[(scenario, lang)] = (n, float(res["mean_val"]))
-
-                            if res["status"] in ("TIMEOUT", "ERRO"):
-                                stopped_runners.add(lang)
+                        for runner in RUNNERS:
+                            lang = runner["name"]
+                            if stopped[lang]:
+                                continue
+                            samples, status, acum = run_block(
+                                runner, algo, cenario, n, directory)
+                            mean = report_block(writer, fh, runner, algo, cenario,
+                                                n, m, samples, status, acum)
+                            if status in ("TIMEOUT", "ERRO"):
+                                stopped[lang] = True
+                            elif algoritmo == "Backtracking" and mean != "":
+                                best[(cenario, lang)] = (n, mean)
                     finally:
-                        clear_live()
-                        clean_instance_files(graph_dir)
+                        clean_instances(directory)
 
-    print_backtracking_summary(best_viable_bt)
+    clear_live()
+    print_summary(best)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        clear_live()
+        print("\nInterrompido pelo usuário.")
+        sys.exit(130)
