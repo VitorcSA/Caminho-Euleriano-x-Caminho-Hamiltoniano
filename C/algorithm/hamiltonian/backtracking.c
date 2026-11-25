@@ -2,7 +2,7 @@
 #include "../graph.h"
 
 int handle(graph_t* graph,int cur,list_t *path){
-	if (graph->cnt == path->cnt) {
+	if (graph->cnt == path->size) {
 		return 0;
 	}
 	for(int i = 0; i < graph->vertexes[cur].cnt;++i){

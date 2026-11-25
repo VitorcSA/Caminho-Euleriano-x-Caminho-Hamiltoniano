@@ -3,7 +3,8 @@
 
 typedef struct list_t {
   int *array;
-  int cnt;
+  int size;
+  int capacity;
 } list_t;
 
 #define list_init() (list_t){0}
